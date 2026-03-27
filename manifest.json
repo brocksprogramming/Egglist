@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "version": "1.0.0",
+  "name": "Egglist",
+  "description": "Detects and protects against scams on Craigslist.org",
+  "permissions": ["storage", "scripting"],
+  "host_permissions": [
+    "https://*.craigslist.org/*",
+    "https://proxy-api-gateway-here/*" 
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "icons": {
+    "16":"icons/egglist_icon16x16.png",
+    "48":"icons/egglist_icon48x48.png",
+    "128":"icons/egglist_icon128x128.png"
+  },
+  "content_scripts": [{
+    "matches": ["https://*.craigslist.org/*"],
+    "js": [
+      "ExtPay.js",
+      "content.js"
+    ]
+  }]
+}
