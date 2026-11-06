@@ -1,0 +1,13 @@
+{
+  "name": "egglist-scam-checker",
+  "version": "1.0.0",
+  "private": true,
+  "main": "cloudfunction.js",
+  "scripts": {
+    "start": "functions-framework --target=checkScam"
+  },
+  "dependencies": {
+    "@google-cloud/functions-framework": "^3.4.5",
+    "@google/generative-ai": "^0.24.1"
+  }
+}

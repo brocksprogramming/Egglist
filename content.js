@@ -1,138 +1,216 @@
-// 1. Initialize ExtPay with your unique ID
-const extpay = ExtPay('your-ext-pay-id'); 
+const SCAN_DELAY = 1200;
+const MAX_LISTING_LENGTH = 8000;
+const pendingScans = new WeakMap();
+const generatedIds = new WeakMap();
+let nextGeneratedId = 1;
 
-// 2. Configuration & State
-const scanDelay = 1500; 
-const pendingScans = new Map();
+const localRules = [
+  {
+    pattern: /\b(?:google voice|verification code|verify(?:ing)? code|security code)\b/i,
+    reason: 'Mentions a verification code, a common account-takeover tactic.'
+  },
+  {
+    pattern: /\b(?:gift cards?|wire transfer|western union|moneygram|crypto(?:currency)?)\b/i,
+    reason: 'Requests a payment method that is difficult to reverse.'
+  },
+  {
+    pattern: /\b(?:zelle|cash ?app|venmo|paypal)\b.{0,80}\b(?:deposit|payment|send|pay|transfer)\b|\b(?:deposit|payment|send|pay|transfer)\b.{0,80}\b(?:zelle|cash ?app|venmo|paypal)\b/i,
+    reason: 'Requests payment through a person-to-person payment service.'
+  },
+  {
+    pattern: /\b(?:ship(?:ping)?|deliver(?:y|ed)?)\b.{0,100}\b(?:deposit|payment|fee|money)\b|\b(?:deposit|payment|fee|money)\b.{0,100}\b(?:ship(?:ping)?|deliver(?:y|ed)?)\b/i,
+    reason: 'Combines shipping or delivery with an upfront payment request.'
+  },
+  {
+    pattern: /\b(?:out of town|moving (?:out|tomorrow)|can't meet|cannot meet|won't be able to meet)\b/i,
+    reason: 'Uses an availability or urgency claim that can be used to avoid an in-person meeting.'
+  }
+];
 
-// 3. The Paywall UI
-function showPaywall(el) {
-  if (el.querySelector('.extpay-banner')) return;
-
-  const banner = document.createElement('div');
-  banner.className = 'extpay-banner';
-  banner.style.cssText = "background: #333; color: #fff; padding: 12px; text-align: center; cursor: pointer; border-radius: 4px; margin-bottom: 10px; font-weight: bold;";
-  banner.innerHTML = "🥚 Egglist: Limit Reached. <span style='text-decoration: underline;'>Upgrade for $5.99/mo</span> to keep cracking scams.";
-  
-  banner.onclick = (e) => {
-    e.stopPropagation();
-    extpay.openPaymentPage();
-  };
-  
-  el.prepend(banner);
-  el.style.filter = 'grayscale(1) opacity(0.5)';
+function getListingId(el) {
+  const id = el.getAttribute('data-pid') || el.getAttribute('data-id') || el.id;
+  if (id) return id;
+  if (!generatedIds.has(el)) generatedIds.set(el, `egglist-${nextGeneratedId++}`);
+  return generatedIds.get(el);
 }
 
-// 4. The UI Injection (What happens when a scam is found)
-function injectScamWarning(el, reason, postId) {
-  if (el.querySelector('.egglist-banner')) return;
+function getAllowlist() {
+  return new Promise((resolve, reject) => {
+    chrome.storage.local.get({ allowlist: [] }, (result) => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+        return;
+      }
+      resolve(result.allowlist);
+    });
+  });
+}
 
-  const box = document.createElement('div');
-  box.className = 'egglist-banner';
-  box.style.cssText = `
-    background: #fff0f0; border-left: 5px solid #ff4444;
-    padding: 10px; margin: 5px 0; font-family: sans-serif;
-    font-size: 13px; color: #333; cursor: pointer; border-radius: 4px;
-  `;
+function setStatus(panel, title, detail, state) {
+  panel.dataset.state = state;
+  panel.replaceChildren();
 
-  box.innerHTML = `
-    <div style="display: flex; justify-content: space-between; align-items: center;">
-      <span><strong>🚩 Probable Scam Detected</strong></span>
-      <span class="toggle-text" style="text-decoration: underline; font-size: 11px;">View Details</span>
-    </div>
-    <div class="scam-details" style="display: none; margin-top: 8px; font-style: italic; border-top: 1px solid #ddd; padding-top: 5px;">
-      <p>AI Analysis: ${reason}</p>
-      <button class="not-a-scam" style="margin-top: 5px; background: #eee; border: 1px solid #ccc; padding: 2px 5px; cursor: pointer; font-size: 10px;">Not a scam? Clear.</button>
-    </div>
-  `;
+  const heading = document.createElement('strong');
+  heading.className = 'egglist-status-title';
+  heading.textContent = title;
+  panel.append(heading);
 
-  // Toggle Details
-  box.onclick = () => {
-    const details = box.querySelector('.scam-details');
-    details.style.display = details.style.display === 'none' ? 'block' : 'none';
-  };
+  if (detail) {
+    const description = document.createElement('span');
+    description.className = 'egglist-status-detail';
+    description.textContent = detail;
+    panel.append(description);
+  }
+}
 
-  // "Not a Scam" Logic
-  box.querySelector('.not-a-scam').onclick = (e) => {
-    e.stopPropagation();
-    chrome.storage.local.get(['allowlist'], (res) => {
-      const list = res.allowlist || [];
-      list.push(postId);
-      chrome.storage.local.set({ allowlist: list }, () => {
-        box.remove();
-        el.style.filter = 'none';
+function makePanel(el) {
+  let panel = el.querySelector(':scope > .egglist-status');
+  if (panel) return panel;
+
+  panel = document.createElement('div');
+  panel.className = 'egglist-status';
+  panel.setAttribute('role', 'status');
+  panel.setAttribute('aria-live', 'polite');
+  panel.addEventListener('click', (event) => {
+    const dismissButton = event.target.closest('.egglist-dismiss');
+    if (!dismissButton) return;
+    event.stopPropagation();
+
+    const id = getListingId(el);
+    chrome.storage.local.get({ allowlist: [] }, (result) => {
+      if (chrome.runtime.lastError) {
+        setStatus(panel, 'Egglist could not save this choice', chrome.runtime.lastError.message, 'error');
+        return;
+      }
+      const allowlist = new Set(result.allowlist);
+      allowlist.add(id);
+      chrome.storage.local.set({ allowlist: [...allowlist] }, () => {
+        if (chrome.runtime.lastError) {
+          setStatus(panel, 'Egglist could not save this choice', chrome.runtime.lastError.message, 'error');
+          return;
+        }
+        setStatus(panel, 'Warning dismissed', 'This listing will not be flagged again.', 'clear');
+        el.classList.remove('egglist-flagged');
       });
     });
-  };
+  });
 
-  el.prepend(box);
-  el.style.filter = 'grayscale(0.8) opacity(0.6)';
+  el.prepend(panel);
+  return panel;
 }
 
-async function processListing(el) {
-  const user = await extpay.getUser();
-  
-  chrome.storage.local.get(['scanCount'], (data) => {
-    const count = data.scanCount || 0;
+function setFlaggedStatus(panel, reasons) {
+  setStatus(panel, 'Potential scam indicators found', reasons.join(' '), 'warning');
+  const dismiss = document.createElement('button');
+  dismiss.className = 'egglist-dismiss';
+  dismiss.type = 'button';
+  dismiss.textContent = 'Dismiss warning';
+  panel.append(dismiss);
+}
 
-    if (!user.paid && count >= 3) {
-      // IMPORTANT: Show the paywall even if we haven't scanned this ad.
-      // This gives the user a way to click "Upgrade" on any listing.
-      showPaywall(el); 
-      return; 
-    }
+function checkLocally(text) {
+  return localRules
+    .filter((rule) => rule.pattern.test(text))
+    .map((rule) => rule.reason);
+}
 
-    // Otherwise, proceed with the scan as normal...
-    runActualScan(el, el.getAttribute('data-pid'), !user.paid);
+function requestAiCheck(text) {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage({ type: 'CHECK_SCAM', text }, (response) => {
+      if (chrome.runtime.lastError) {
+        resolve({ status: 'unavailable', error: chrome.runtime.lastError.message });
+        return;
+      }
+      resolve(response || { status: 'unavailable', error: 'The extension received no response.' });
+    });
   });
 }
 
+async function scanListing(el) {
+  if (!el.isConnected || el.classList.contains('egglist-scanned')) return;
+  el.classList.add('egglist-scanned');
+  const panel = makePanel(el);
+  setStatus(panel, 'Checking this listing…', 'Local checks and optional AI analysis are running.', 'checking');
 
-function runActualScan(el, postId, incrementCount = false) {
-  el.classList.add('scanned'); // Mark so we don't scan twice
-  const text = el.innerText;
-
-  chrome.runtime.sendMessage({ type: 'CHECK_SCAM', text }, (response) => {
-    if (response?.isScam) {
-      injectScamWarning(el, response.reason, postId);
+  try {
+    const id = getListingId(el);
+    if ((await getAllowlist()).includes(id)) {
+      setStatus(panel, 'Warning dismissed', 'This listing is on your allowlist.', 'clear');
+      return;
     }
-    
-    if (incrementCount) {
-      chrome.storage.local.get(['scanCount'], (res) => {
-        chrome.storage.local.set({ scanCount: (res.scanCount || 0) + 1 });
-      });
+
+    const text = (el.innerText || '').slice(0, MAX_LISTING_LENGTH);
+    const localFindings = checkLocally(text);
+    const ai = await requestAiCheck(text);
+    const findings = [...localFindings];
+
+    if (ai.status === 'ok' && ai.isScam === true && typeof ai.reason === 'string') {
+      findings.push(`AI analysis: ${ai.reason}`);
     }
-  });
-}
 
-// 6. The Observer (Efficiency)
-const observer = new IntersectionObserver((entries) => {
-  entries.forEach(entry => {
-    const el = entry.target;
-    const listingId = el.getAttribute('data-pid');
-
-    if (entry.isIntersecting && !el.classList.contains('scanned')) {
-      const timer = setTimeout(() => {
-        processListing(el);
-      }, scanDelay);
-      pendingScans.set(listingId, timer);
+    if (findings.length) {
+      el.classList.add('egglist-flagged');
+      setFlaggedStatus(panel, findings);
+    } else if (ai.status === 'ok' && ai.isScam === false) {
+      setStatus(panel, 'No known scam indicators found', 'Local checks and AI analysis found no obvious warning signs.', 'clear');
     } else {
-      clearTimeout(pendingScans.get(listingId));
-      pendingScans.delete(listingId);
+      const detail = ai.error || (ai.status === 'not-configured'
+        ? 'AI analysis is not configured.'
+        : 'AI analysis could not be completed.');
+      setStatus(panel, 'Local check only', `No local warning signs found. ${detail} This is not a guarantee that the listing is safe.`, 'unavailable');
     }
-  });
-}, { threshold: 0.5 });
+  } catch (error) {
+    setStatus(panel, 'Scan could not be completed', error.message || 'An unexpected error occurred.', 'error');
+  }
+}
 
-// 7. Initialization
-const init = () => {
-  // Craigslist uses '.cl-static-search-result' or '.gallery-card' depending on view
-  const selector = '.cl-static-search-result, .gallery-card, .result-row';
-  document.querySelectorAll(selector).forEach(el => observer.observe(el));
-};
+function addStyles() {
+  if (document.getElementById('egglist-styles')) return;
+  const style = document.createElement('style');
+  style.id = 'egglist-styles';
+  style.textContent = `
+    .egglist-status {
+      box-sizing: border-box; display: flex; flex-direction: column; gap: 4px;
+      margin: 6px 0; padding: 9px 11px; border-left: 4px solid #687386;
+      border-radius: 3px; background: #f2f4f7; color: #202124;
+      font: 13px/1.4 Arial, sans-serif;
+    }
+    .egglist-status[data-state="checking"] { border-color: #4285f4; }
+    .egglist-status[data-state="clear"] { border-color: #188038; }
+    .egglist-status[data-state="warning"] { border-color: #d93025; background: #fff3f2; }
+    .egglist-status[data-state="unavailable"],
+    .egglist-status[data-state="error"] { border-color: #e37400; background: #fff8e1; }
+    .egglist-status-detail { overflow-wrap: anywhere; }
+    .egglist-dismiss {
+      align-self: flex-start; margin-top: 3px; padding: 3px 7px;
+      border: 1px solid #777; border-radius: 3px; background: #fff; cursor: pointer;
+    }
+    .egglist-flagged { outline: 2px solid #d93025; outline-offset: 1px; }
+  `;
+  document.documentElement.append(style);
+}
 
-// Run on load and whenever Craigslist loads more (infinite scroll)
+const observer = new IntersectionObserver((entries) => {
+  for (const entry of entries) {
+    const el = entry.target;
+    if (entry.isIntersecting && !el.classList.contains('egglist-scanned')) {
+      if (pendingScans.has(el)) clearTimeout(pendingScans.get(el));
+      pendingScans.set(el, setTimeout(() => {
+        pendingScans.delete(el);
+        scanListing(el);
+      }, SCAN_DELAY));
+    } else if (!entry.isIntersecting && pendingScans.has(el)) {
+      clearTimeout(pendingScans.get(el));
+      pendingScans.delete(el);
+    }
+  }
+}, { threshold: 0.25 });
+
+function init() {
+  addStyles();
+  document.querySelectorAll('.cl-static-search-result, .gallery-card, .result-row')
+    .forEach((el) => observer.observe(el));
+}
+
 init();
-const scrollObserver = new MutationObserver(init);
-scrollObserver.observe(document.body, { childList: true, subtree: true });
-
-
+new MutationObserver(init).observe(document.body, { childList: true, subtree: true });

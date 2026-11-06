@@ -1,36 +1,33 @@
-Egglist: AI-Powered Craigslist Scam Protection
-Egglist is a lightweight Chrome extension designed to make local browsing safer. It uses advanced AI to analyze Craigslist listings in real-time, flagging suspicious patterns and potential fraud before you even click.
+# Egglist
 
-🚀 Purpose
-Craigslist is a goldmine for deals, but it's also a playground for scammers. Egglist acts as an automated second set of eyes, specifically looking for:
+Egglist adds visible scam-check status to Craigslist search listings. It runs local checks for several common scam signals and can optionally ask a Gemini-backed service for a second opinion.
 
-Too-good-to-be-true pricing (e.g., luxury rentals for pennies).
+## What the status means
 
-Suspicious payment requests (Zelle, wire transfers, or gift cards).
+- **Potential scam indicators found** means local checks or the AI service noticed a warning sign. It is not proof that the listing is fraudulent.
+- **No known scam indicators found** means the local checks and configured AI service found no obvious warning signs. It is not a guarantee that the listing is safe.
+- **Local check only** means local checks ran, but AI analysis was unavailable or has not been configured.
+- **Scan could not be completed** means Egglist encountered an error. It does not mean the listing is safe.
 
-Urgency & Pressure tactics ("I'm moving tomorrow," "out of town").
+Egglist currently highlights listings; it does not hide them or prevent opening them. Use normal caution, especially around payments and requests for verification codes.
 
-Identity theft traps (Google Voice verification code scams).
+## Install
 
-🛠️ How It Works
-Seamless Integration: Once installed, Egglist sits quietly in your browser.
+1. Open `chrome://extensions` and enable **Developer mode**.
+2. Select **Load unpacked** and choose this project directory.
+3. Visit a Craigslist search results page on `craigslist.com` or `craigslist.org`. Egglist checks listings when they become visible.
 
-Live Analysis: As you scroll through Craigslist listings, the extension's IntersectionObserver detects visible ads and sends a snippet of the text to a secure, private analysis engine.
+## Optional Gemini analysis
 
-Visual Indicators: If a listing is flagged as a likely scam, Egglist injects a clear visual warning directly onto the Craigslist page, saving you from wasting time or risking your money.
+Local checks work without an AI service. To enable Gemini:
 
-Privacy-First: The extension only processes the public text of the ads you view. It does not access your personal Craigslist account or private messages.
+1. Deploy `cloudfunction.js` as a Google Cloud Function using the Functions Framework, with `GEMINI_API_KEY` set as a server-side environment variable. Do not put the API key in the extension.
+2. Set `AI_ENDPOINT` in `background.js` to the deployed HTTPS function URL.
+3. Add that function's HTTPS origin to `host_permissions` in `manifest.json`.
+4. Reload Egglist at `chrome://extensions`.
 
-📦 Installation & Setup
-Download: Clone the repository or download the packed extension file.
+The function accepts listing text, limited to 8,000 characters, and returns `{ "isScam": boolean, "reason": string }`. The extension sends the public text of visible listings for analysis when the service is configured. AI output can be wrong and should be treated as advisory.
 
-Developer Mode: Open chrome://extensions, toggle Developer mode on, and click Load unpacked.
+## Development
 
-Browse: Navigate to any Craigslist search results page and look for the Egglist status indicators.
-
-⚙️ Technical Overview
-Frontend: JavaScript (ES6), CSS3, Chrome Extensions API (Manifest V3).
-
-Backend: Node.js Cloud Functions.
-
-AI Engine: Powered by Google Gemini.
+The extension uses Manifest V3 and has no local build step. After changing files, reload it from `chrome://extensions` and refresh the Craigslist tab.
